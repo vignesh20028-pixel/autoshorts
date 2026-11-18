@@ -107,13 +107,14 @@ def download_video(url, workdir, cookies_path=None):
         return o
 
     last_err = None
-    for clients in (["android", "web_safari"], ["ios", "web"], ["tv"], ["web"]):
+        # Try a more effective sequence of player clients to bypass bot checks
+    for clients in (["tv", "mweb"], ["web_safari"], ["android_vr"], ["ios", "web"]):
         try:
             with yt_dlp.YoutubeDL(_opts(clients)) as ydl:
                 ydl.download([url])
             last_err = None
             break
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             last_err = e
     if last_err:
         raise RuntimeError(
