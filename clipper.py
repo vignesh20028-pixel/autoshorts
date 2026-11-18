@@ -13,6 +13,7 @@ import glob
 import urllib.parse
 import urllib.request
 import subprocess
+import time
 
 import cv2
 import numpy as np
@@ -226,61 +227,85 @@ def _snap(t, boundaries, tol=1.5):
     best = min(boundaries, key=lambda b: abs(b - t))
     return best if abs(best - t) <= tol else t
 
+def _chunk_segments(segments, max_seconds=120):
+    """Split transcript segments into chunks of roughly max_seconds."""
+    chunks, current, current_start = [], [], None
+    for seg in segments:
+        if current_start is None:
+            current_start = seg["start"]
+        current.append(seg)
+        if seg["end"] - current_start >= max_seconds:
+            chunks.append(current)
+            current, current_start = [], None
+    if current:
+        chunks.append(current)
+    return chunks
+    # add this at the top if it isn't already there
 
 def analyze_clips(segments, client, n_clips, min_len, max_len, duration):
-    transcript = "\n".join(
-        f"[{s['start']:.1f}-{s['end']:.1f}] {s['text']}" for s in segments
-    )[:120000]
+    chunks = _chunk_segments(segments, max_seconds=120)  # ~2-minute windows
+    all_candidates = []
 
-    prompt = f"""You are a viral short-form video editor. Pick the {n_clips} most clip-worthy moments from this transcript for YouTube Shorts / TikTok / Reels.
-
-HARD RULES:
-- Each clip MUST be between {min_len} and {max_len} seconds long.
-- Clips must NOT overlap.
-- Use ONLY the timestamps present in the transcript. Never invent times.
-- A clip must open with a self-contained hook and end on a payoff/punchline.
-- Strong signals: surprising claims, strong opinions, emotional stories, conflict, actionable tips, funny moments, numbers/stats.
-
-TRANSCRIPT (format: [start-end] text):
-{transcript}
-
-Return ONLY valid JSON in this shape:
+    for chunk in chunks:
+        transcript = "\n".join(
+            f"[{s['start']:.1f}-{s['end']:.1f}] {s['text']}" for s in chunk
+        )
+        prompt = f"""Pick up to 2 clip-worthy moments from this transcript excerpt for YouTube Shorts.
+Each clip must be between {min_len} and {max_len} seconds long and must open with a hook.
+Use ONLY the timestamps shown. Return JSON:
 {{"clips":[{{"start":12.5,"end":48.0,"title":"max 8 words","hook_score":8,"reason":"max 20 words"}}]}}
-"""
-    resp = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        temperature=0.4,
-        max_tokens=8192,
-    )
-    raw = resp.choices[0].message.content
-    try:
-        clips = json.loads(raw).get("clips", [])
-    except json.JSONDecodeError:
-        raise RuntimeError(f"LLM returned invalid JSON:\n{raw[:500]}")
 
+TRANSCRIPT:
+{transcript}
+"""
+        # Retry with exponential backoff for rate-limit errors
+        for attempt in range(4):
+            try:
+                resp = client.chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"},
+                    temperature=0.4,
+                    max_tokens=1024,          # keep room under the 8K TPM ceiling
+                )
+                break
+            except Exception as e:
+                if ("413" in str(e) or "429" in str(e)) and attempt < 3:
+                    time.sleep(2 ** attempt)  # 1s, 2s, 4s
+                    continue
+                raise
+
+        raw = resp.choices[0].message.content
+        try:
+            chunk_clips = json.loads(raw).get("clips", [])
+        except json.JSONDecodeError:
+            continue  # skip a malformed chunk rather than failing the whole job
+
+        for c in chunk_clips:
+            try:
+                start, end = float(c["start"]), float(c["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            # Snap to real transcript boundaries
+            all_candidates.append({
+                "start": round(max(0.0, start), 2),
+                "end":   round(min(duration, end), 2),
+                "title": str(c.get("title", "Clip"))[:80],
+                "score": int(c.get("hook_score", 5) or 5),
+                "reason": str(c.get("reason", ""))[:160],
+            })
+
+    # --- Post-process: filter, de-duplicate, and pick top N ---
     boundaries = sorted({round(s["start"], 2) for s in segments} |
                         {round(s["end"], 2) for s in segments})
 
     cleaned = []
-    for c in clips:
-        try:
-            start = float(c["start"])
-            end = float(c["end"])
-        except (KeyError, TypeError, ValueError):
+    for c in all_candidates:
+        c["start"] = _snap(c["start"], boundaries)
+        c["end"]   = _snap(c["end"], boundaries)
+        if c["end"] - c["start"] < min_len * 0.6 or c["end"] - c["start"] > max_len * 1.5:
             continue
-        start = _snap(max(0.0, start), boundaries)
-        end = _snap(min(duration, end), boundaries)
-        if end - start < min_len * 0.6 or end - start > max_len * 1.5:
-            continue
-        cleaned.append({
-            "start": round(start, 2),
-            "end":   round(min(end, start + max_len), 2),
-            "title": str(c.get("title", "Clip"))[:80],
-            "score": int(c.get("hook_score", 5) or 5),
-            "reason": str(c.get("reason", ""))[:160],
-        })
+        cleaned.append(c)
 
     cleaned.sort(key=lambda c: c["score"], reverse=True)
     kept = []
@@ -289,6 +314,7 @@ Return ONLY valid JSON in this shape:
             kept.append(c)
         if len(kept) >= n_clips:
             break
+
     if not kept:
         raise RuntimeError("No valid clips found. Try a longer video or more clips.")
     return sorted(kept, key=lambda c: c["start"])
