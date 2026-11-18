@@ -23,7 +23,7 @@ from groq import Groq
 # --------------------------------------------------------------------------- #
 WHISPER_MODEL    = "whisper-large-v3"
 WHISPER_FALLBACK = "whisper-large-v3-turbo"
-LLM_MODEL        = "llama-3.3-70b-versatile"
+LLM_MODEL        = "openai/gpt-oss-120b"
 
 FONTS_DIR = "/usr/share/fonts/truetype/dejavu"
 COLS      = ["use", "start", "end", "title", "score", "reason"]
@@ -252,7 +252,7 @@ Return ONLY valid JSON in this shape:
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
         temperature=0.4,
-        max_tokens=2000,
+        max_tokens=8192,
     )
     raw = resp.choices[0].message.content
     try:
